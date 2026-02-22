@@ -1,0 +1,17 @@
+*.json
+*.dat
+*.ex5
+*.log
+*.ico
+/Files
+/Images
+*/Examples
+*/Free Robots
+*/Free Indicators
+/Include
+*/Charts
+*/Community
+*/deleted
+*/SymbolSets
+*/Tester
+*/UnitTests
