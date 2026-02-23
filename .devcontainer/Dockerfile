@@ -4,6 +4,7 @@ RUN dpkg --add-architecture i386
 
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
+    wine \
     wine64 \
     wine32 \
     xvfb \
