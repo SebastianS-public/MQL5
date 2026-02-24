@@ -9,10 +9,11 @@
   "customizations": {
     "vscode": {
       "extensions": [
-        "L-I-V.mql-tools"
+        "L-I-V.mql-tools",
+        "ms-vscode.cpptools-extension-pack"
       ],
       "settings": {
-        "mql_tools.Metaeditor.Metaeditor5Dir": "/workspaces/MQL5/MetaEditor64.exe"
+        "mql_tools.Metaeditor.Metaeditor5Dir": "${workspaceFolder}/MetaEditor64.exe"
       }
     }
   },
