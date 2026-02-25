@@ -6,6 +6,5 @@
         "nicholishen.mql-over-cpp"
       ]
     }
-  },
-  "postStartCommand": "Xvfb :99 -screen 0 1024x768x16 &"
+  }
 }
