@@ -1,20 +1,10 @@
 {
   "name": "MQL5 Codespace",
-  "build": {
-    "dockerfile": "Dockerfile"
-  },
-  "containerEnv": {
-    "DISPLAY": ":99"
-  },
   "customizations": {
     "vscode": {
       "extensions": [
-        "L-I-V.mql-tools",
-        "ms-vscode.cpptools-extension-pack"
-      ],
-      "settings": {
-        "mql_tools.Metaeditor.Metaeditor5Dir": "${workspaceFolder}/MetaEditor64.exe"
-      }
+        "nicholishen.mql-over-cpp"
+      ]
     }
   },
   "postStartCommand": "Xvfb :99 -screen 0 1024x768x16 &"
