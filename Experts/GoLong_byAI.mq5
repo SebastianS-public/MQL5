@@ -37,7 +37,7 @@ bool                 recoveredFromHoliday = false;       // Flag: we just had a 
 
 // ==================== INITIALIZATION ====================
 void OnInit() {
-   manager.Init(_Symbol, MagicNumber, 5, 50, 10, 200);
+   manager.Init(_Symbol, MagicNumber, 5, 500, 10, 200);
    
    // Set risk management mode and value
    manager.SetRiskSettings(RiskMode, GetRiskValue());

@@ -2,213 +2,221 @@
 
 #include <Trade/Trade.mqh>
 
-// Constants for circular buffers (must be #define for array sizing)
-#define MAX_QUEUE_SIZE 512
-#define FATAL_BUFFER_SIZE 128
-#define MAX_STRATEGIES 16  // Maximum symbols per instance
+// Constants for static array initializations
+#define MAX_QUEUE_SIZE 1024
+#define FATAL_BUFFER_SIZE 256
+#define MAX_STRATEGIES 32
 
+// EA Processing States
 enum EAState {
    STATE_PROCESSING_CLOSE,
    STATE_PROCESSING_DELETE,
    STATE_PROCESSING_MODIFY 
 };
 
+// Risk Management Modes
 enum RiskManagementMode {
    RiskFixedLot,
    RiskPercentBalance,
    RiskFixedMoney
 };
 
-// Added Enum for Request Status reporting
+// Request Status for tracking (per symbol)
 enum RequestStatus {
-   REQ_STATUS_SUCCESS, // Not pending, not in fatal buffer -> Assumed Success
-   REQ_STATUS_PENDING, // Still in queue or retrying
-   REQ_STATUS_ERROR    // Found in fatal error buffer
+   REQ_STATUS_SUCCESS,
+   REQ_STATUS_PENDING,
+   REQ_STATUS_ERROR
 };
 
+// Trade Request Structure
 struct TradeRequest {
-   ENUM_ORDER_TYPE   type;
-   double            volume;
-   double            price;
-   double            sl;
-   double            tp;
-   datetime          expiration;
-   string            comment;
-   datetime          retryAt; 
-   int               requestID; // Added for ID Tracking
-};
-
-struct TicketRequest {
-   ulong    ticket;
-   EAState  action; 
-   double   sl;     
-   double   tp;     
+   ENUM_ORDER_TYPE type;
+   double volume;
+   double price;
+   double sl;
+   double tp;
+   datetime expiration;
+   string comment;
    datetime retryAt; 
-   int      requestID; // Added for ID Tracking
+   int requestID;
 };
 
+// Ticket Request Structure
+struct TicketRequest {
+   ulong ticket;
+   EAState action;
+   double sl;
+   double tp;
+   datetime retryAt;
+   int requestID;
+};
+
+// Strategy Structure
+struct StrategyStruct {
+   // Trade and Ticket Circular Buffers
+   TradeRequest tradeQueue[MAX_QUEUE_SIZE];
+   int tradeQueueHead;
+   int tradeQueueTail;
+   int tradeQueueCount;
+   TicketRequest ticketQueue[MAX_QUEUE_SIZE];
+   int ticketQueueHead;
+   int ticketQueueTail;
+   int ticketQueueCount;
+
+   // Symbol specific market info
+   double tickSize;
+   double point;
+   double volStep;
+   double volMin;
+   double volMax;
+   int digits;
+   long stopLevel;
+   ENUM_ORDER_TYPE_FILLING fillingType;
+
+   // strategy specific settings
+   CTrade trade;
+   string symbolName;
+   int magicNumber;
+   int stopLevelOverride;
+   int maxSpread;
+   int slippage;
+   RiskManagementMode riskMode;
+   double riskValue;
+   
+   // refresh timer
+   ulong lastRefreshTime;
+};
+
+// COrderManager Class Definition
 class COrderManager {
 private:
-   CTrade            m_trade;
    
    // Multi-symbol infrastructure
-   string            m_symbols[16];
-   int               m_symbolCount;
+   StrategyStruct m_strategies[MAX_STRATEGIES];
+   int m_symbolCount;
    
-   // Per-symbol circular buffers (fixed size for backtesting efficiency)
-   TradeRequest      m_tradeQueues[16][512];
-   int               m_tradeQueueHeads[16];
-   int               m_tradeQueueTails[16];
-   int               m_tradeQueueCounts[16];
-   
-   TicketRequest     m_ticketQueues[16][512];
-   int               m_ticketQueueHeads[16];
-   int               m_ticketQueueTails[16];
-   int               m_ticketQueueCounts[16];
-   
-   // Per-symbol market info (refreshed periodically)
-   double            m_tickSizes[16];
-   double            m_points[16];
-   double            m_volSteps[16];
-   double            m_volMins[16];
-   double            m_volMaxs[16];
-   int               m_stopLevels[16];
-   
-   // Per-symbol refresh timing
-   ulong             m_lastSymbolRefresh[16];
-   int               m_symbolRefreshBars[16];
-   ENUM_ORDER_TYPE_FILLING m_fillingTypes[16];
-   datetime          m_lastBarTime[16];     // Track last bar time for efficient bar detection in tester
-   
-   // Circular buffer for fatal request IDs (keeps most recent 128 failures)
-   int               m_fatalIDBuffer[128];
-   int               m_fatalIDCount;        // Current number of entries (0-128)
-   int               m_fatalIDIndex;        // Next write position (circular)
+   // Circular buffer for fatal request IDs
+   int m_fatalIDBuffer[FATAL_BUFFER_SIZE];
+   int m_fatalIDCount;
+   int m_fatalIDIndex;
 
-   int               m_magicNumber;
-   int               m_retryDelay;
-   int               m_maxSpread;
-   int               m_slippage;
-   
-   // Changed to ulong to match GetTickCount64
-   ulong             m_processingBudgetMs;
-   
-   bool              m_isTester;
-
-   RiskManagementMode m_riskMode;
-   double             m_riskValue;
+   // General settings and state variables
+   int m_retryDelay;
+   ulong m_processingBudgetMs;
+   bool m_isTester;
 
    // Helper: Find symbol index, return -1 if not found
-   int GetSymbolIndex(string symbol) {
+   int GetSymbolIndex(int symbolMagic) {
       for(int i = 0; i < m_symbolCount; i++) {
-         if(m_symbols[i] == symbol) return i;
+         if(m_strategies[i].magicNumber == symbolMagic) return i;
       }
       return -1;
    }
 
+   // Helper: Is Equal check for doubles with epsilon tolerance
+   bool DoubleComparison(double a, string operation, double b) {
+      double epsilon = 1e-8;
+      bool equal = MathAbs(a - b) <= epsilon;
+      if(operation == "EQUAL") {
+         return equal;
+      }
+      if(operation == "LESS OR EQUAL") {
+         return (a < b || equal);
+      }
+      if(operation == "GREATER OR EQUAL") {
+         return (a > b || equal);
+      }
+      return false;
+   }
+
+   // Helper: Get filling type for symbol
    ENUM_ORDER_TYPE_FILLING GetFillingType(string symbol) {
-      int filling = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+      long filling = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
       if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
       if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
+      if((filling & SYMBOL_FILLING_BOC) == SYMBOL_FILLING_BOC) return ORDER_FILLING_BOC;
       return ORDER_FILLING_RETURN;
    }
 
-   double NormalizePrice(double p) {
-      if(p <= 0) return 0;
-      // Note: For multi-symbol, tickSize varies per symbol
-      // This is a fallback; prefer NormalizePriceSymbol()
-      return NormalizeDouble(p, _Digits);
-   }
-
    // Normalize price for specific symbol
-   double NormalizePriceSymbol(string symbol, double p) {
-      if(p <= 0) return 0;
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0) return NormalizeDouble(p, _Digits);
-      if(m_tickSizes[idx] == 0) return NormalizeDouble(p, _Digits);
-      return NormalizeDouble(MathRound(p / m_tickSizes[idx]) * m_tickSizes[idx], _Digits);
+   double NormalizePriceSymbol(int symbolMagic, double p) {
+      int idx = GetSymbolIndex(symbolMagic);
+      if(idx < 0) {
+         Print("Error: NormalizePriceSymbol - Symbol with magic ", symbolMagic, " not found. Returning 0.");
+         return 0;
+      }
+      return NormalizeDouble(MathRound(p / m_strategies[idx].tickSize) * m_strategies[idx].tickSize, m_strategies[idx].digits);
    }
 
    // Normalize volume for specific symbol
-   double NormalizeVolSymbol(string symbol, double v) {
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0) return NormalizeDouble(v, 2);
-      double vol = MathFloor(v / m_volSteps[idx]) * m_volSteps[idx];
-      if(vol < m_volMins[idx]) vol = m_volMins[idx];
-      if(vol > m_volMaxs[idx]) vol = m_volMaxs[idx];
+   double NormalizeVolSymbol(int symbolMagic, double v) {
+      int idx = GetSymbolIndex(symbolMagic);
+      if(idx < 0) {
+         Print("Error: NormalizeVolSymbol - Symbol with magic ", symbolMagic, " not found. Returning 0.");
+         return 0;
+      }
+      double vol = MathFloor(v / m_strategies[idx].volStep) * m_strategies[idx].volStep;
+      if(DoubleComparison(vol, "EQUAL", m_strategies[idx].volMin)) {
+         vol = m_strategies[idx].volMin;
+      }
+      if(DoubleComparison(vol, "EQUAL", m_strategies[idx].volMax)) {
+         vol = m_strategies[idx].volMax;
+      }
       return NormalizeDouble(vol, 2);
    }
 
-   bool CheckStopLevel(ENUM_ORDER_TYPE type, double reqPrice, double curAsk, double curBid) {
-      // Optimization: Skip stop level checks in tester to maximize speed
-      if(m_isTester) return true;
-
+   // Check stop level for pending order types per symbol
+   bool CheckStopLevelSymbol(int symbolMagic, ENUM_ORDER_TYPE type, double reqPrice, double curAsk, double curBid) {
       if(type == ORDER_TYPE_BUY || type == ORDER_TYPE_SELL) return true;
       
-      // Note: For multi-symbol, stopLevel varies per symbol
-      // This method kept for compatibility; prefer CheckStopLevelSymbol()
-      return true;
-   }
-
-   // Check stop level for specific symbol
-   bool CheckStopLevelSymbol(string symbol, ENUM_ORDER_TYPE type, double reqPrice, double curAsk, double curBid) {
-      // Optimization: Skip stop level checks in tester to maximize speed
-      if(m_isTester) return true;
-
-      if(type == ORDER_TYPE_BUY || type == ORDER_TYPE_SELL) return true;
-      
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0) return true;
-      
-      double minDist = m_stopLevels[idx] * m_points[idx];
+      int idx = GetSymbolIndex(symbolMagic);
+      double minDist = m_strategies[idx].stopLevel * m_strategies[idx].point;
 
       // BUY_STOP must be above current ask by minimum distance
       if(type == ORDER_TYPE_BUY_STOP) {
          if(reqPrice - curAsk < minDist) {
-            Print("Error: BUY_STOP too close to Ask. Price: ", reqPrice, " Ask: ", curAsk, " MinDist: ", minDist);
+            Print("Error: BUY_STOP too close to Ask. Symbol: ", symbolMagic, " Price: ", reqPrice, " Ask: ", curAsk, " MinDist: ", minDist);
             return false;
          }
       }
       // SELL_LIMIT must be above current bid by minimum distance
       if(type == ORDER_TYPE_SELL_LIMIT) {
          if(reqPrice - curBid < minDist) {
-            Print("Error: SELL_LIMIT too close to Bid. Price: ", reqPrice, " Bid: ", curBid, " MinDist: ", minDist);
+            Print("Error: SELL_LIMIT too close to Bid. Symbol: ", m_strategies[idx].symbolName, " Price: ", reqPrice, " Bid: ", curBid, " MinDist: ", minDist);
             return false;
          }
       }
       // SELL_STOP must be below current bid by minimum distance
       if(type == ORDER_TYPE_SELL_STOP) {
          if(curBid - reqPrice < minDist) {
-            Print("Error: SELL_STOP too close to Bid. Price: ", reqPrice, " Bid: ", curBid, " MinDist: ", minDist);
+            Print("Error: SELL_STOP too close to Bid. Symbol: ", m_strategies[idx].symbolName, " Price: ", reqPrice, " Bid: ", curBid, " MinDist: ", minDist);
             return false;
          }
       }
       // BUY_LIMIT must be below current ask by minimum distance
       if(type == ORDER_TYPE_BUY_LIMIT) {
          if(curAsk - reqPrice < minDist) {
-            Print("Error: BUY_LIMIT too close to Ask. Price: ", reqPrice, " Ask: ", curAsk, " MinDist: ", minDist);
+            Print("Error: BUY_LIMIT too close to Ask. Symbol: ", m_strategies[idx].symbolName, " Price: ", reqPrice, " Ask: ", curAsk, " MinDist: ", minDist);
             return false;
          }
       }
-      return true;
+      Print("Unexpected error when checking stop level for symbol ", m_strategies[idx].symbolName, " with type ", type);
+      return false;
    }
 
    // O(1) circular buffer write - overwrites oldest fatal ID when buffer full
    void AddToFatalBuffer(int id) {
-      if(id <= 0) return;
-      
       // Always insert, overwrite oldest if full
       m_fatalIDBuffer[m_fatalIDIndex] = id;
-      m_fatalIDIndex = (m_fatalIDIndex + 1) % 128;
+      m_fatalIDIndex = (m_fatalIDIndex + 1) % FATAL_BUFFER_SIZE;
       
       // Track count until we hit capacity
-      if(m_fatalIDCount < 128) {
+      if(m_fatalIDCount < FATAL_BUFFER_SIZE) {
          m_fatalIDCount++;
       }
    }
    
-   // O(n) linear buffer search where n <= 128 (keeps recent 128 fatal IDs)
-   // Practical performance is acceptable due to small buffer size
+   // O(n) linear buffer search
    bool IsIDInFatalBuffer(int id) {
       if(id <= 0) return false;
       for(int i = 0; i < m_fatalIDCount; i++) {
@@ -217,18 +225,7 @@ private:
       return false;
    }
 
-   // Efficient bar detection using iTime() instead of SeriesInfoInteger()
-   // iTime() is cached by MT5, very fast compared to terminal API calls
-   bool OnNewBar(int symbolIdx) {
-      datetime currentBarTime = iTime(m_symbols[symbolIdx], _Period, 0);
-      
-      if(currentBarTime != m_lastBarTime[symbolIdx]) {
-         m_lastBarTime[symbolIdx] = currentBarTime;
-         return true;
-      }
-      return false;
-   }
-
+   //Public methods
 public:
    COrderManager() { 
       m_symbolCount = 0;
@@ -236,67 +233,88 @@ public:
       m_fatalIDIndex = 0;
       
       // Initialize all symbol arrays
-      for(int s = 0; s < 16; s++) {
-         m_symbols[s] = "";
-         m_tradeQueueHeads[s] = 0;
-         m_tradeQueueTails[s] = 0;
-         m_tradeQueueCounts[s] = 0;
-         m_ticketQueueHeads[s] = 0;
-         m_ticketQueueTails[s] = 0;
-         m_ticketQueueCounts[s] = 0;
-         m_symbolRefreshBars[s] = -1;
-         m_lastSymbolRefresh[s] = 0;
-         m_lastBarTime[s] = 0;  // Initialize bar time tracking
+      for(int s = 0; s < MAX_STRATEGIES; s++) {
+         TradeRequest tradeQueue[MAX_QUEUE_SIZE] = {};
+         int tradeQueueHead = 0;
+         int tradeQueueTail = 0;
+         int tradeQueueCount = 0;
+         TicketRequest ticketQueue[MAX_QUEUE_SIZE] = {};
+         int ticketQueueHead = 0;
+         int ticketQueueTail = 0;
+         int ticketQueueCount = 0;
+
+         double tickSize = 0.0;
+         double point = 0.0;
+         double volStep = 0.0;
+         double volMin = 0.0;
+         double volMax = 0.0;
+         int digits = 0;
+         long stopLevel = 0;
+         ENUM_ORDER_TYPE_FILLING fillingType = 0;
+
+         string symbolName = NULL;
+         int magicNumber = 0;
+         int stopLevelOverride = 0;
+         int maxSpread = 0;
+         int slippage = 0;
+         RiskManagementMode riskMode = {};
+         double riskValue = 0.0;
+         
+         ulong lastRefreshTime = 0;
       }
       
       // Initialize fatal ID buffer
-      for(int i = 0; i < 128; i++) {
+      for(int i = 0; i < FATAL_BUFFER_SIZE; i++) {
          m_fatalIDBuffer[i] = 0;
       }
    }
 
-   // Initialize with first symbol
-   void Init(string symbol, int magic, int retryDelay=5, int maxSpread=50, int slippage=10, uint timeBudgetMs=200) {
-      m_magicNumber  = magic;
-      m_retryDelay   = retryDelay;
-      m_maxSpread    = maxSpread;
-      m_slippage     = slippage;
-      
-      m_isTester     = (bool)MQLInfoInteger(MQL_TESTER);
+   // Initialize base settings
+   void Init(int retryDelay=5, uint timeBudgetMs=200) {
+      m_retryDelay = retryDelay;
+      m_isTester = MQLInfoInteger(MQL_TESTER);
 
       if(m_isTester) {
          m_processingBudgetMs = ULONG_MAX; // Remove timing constraints in tester
-      } else {
-         m_processingBudgetMs = (ulong)timeBudgetMs;
       }
-      
-      m_trade.SetExpertMagicNumber(m_magicNumber);
-      m_trade.SetDeviationInPoints(m_slippage);
-      m_trade.SetAsyncMode(false);
-      
-      // Add first symbol
-      AddSymbol(symbol);
+      else {
+         m_processingBudgetMs = timeBudgetMs;
+      }
    }
 
-   // Add a symbol to the manager
-   bool AddSymbol(string symbol) {
-      if(m_symbolCount >= 16) {
-         Print("Error: Maximum 16 symbols per instance");
+   // Add a symbol to the manager and init symbol specific settings
+   bool AddSymbol(int magic, string symbol, int maxSpread=100, int slippage=10, int stopLevelOverride=0, RiskManagementMode riskMode=RiskPercentBalance, double riskValue=2.0) {
+      int idx = m_symbolCount;
+
+      if(idx >= MAX_STRATEGIES - 1) {
+         Print("Error: Maximum ", MAX_STRATEGIES, " symbols per instance");
          return false;
       }
-      
+
       // Check if symbol already added
-      if(GetSymbolIndex(symbol) >= 0) {
-         Print("Symbol ", symbol, " already registered");
+      if(GetSymbolIndex(magic) >= 0) {
+         Print("Strategy with magic number ", magic, " already registered");
          return false;
       }
-      
-      int idx = m_symbolCount++;
-      m_symbols[idx] = symbol;
+
+      m_strategies[idx].symbolName = symbol;
+      m_strategies[idx].magicNumber = magic;
+      m_strategies[idx].stopLevelOverride = stopLevelOverride;
+      m_strategies[idx].maxSpread = maxSpread;
+      m_strategies[idx].slippage = slippage;
+      m_strategies[idx].trade.SetDeviationInPoints(slippage);
+      m_strategies[idx].trade.SetExpertMagicNumber(magic);
+      m_strategies[idx].trade.SetAsyncMode(false);
+      m_strategies[idx].riskMode = riskMode;
+      m_strategies[idx].riskValue = riskValue;
       
       // Fetch symbol info
-      RefreshSymbolInfo(idx);
-      
+      if (!RefreshSymbolInfo(idx)) {
+         Print("Error: Failed to refresh symbol info for ", symbol);
+         return false;
+      }
+      m_symbolCount++;
+      Print("Added symbol ", symbol, " with magic ", magic, " at index ", idx);
       return true;
    }
 
@@ -308,81 +326,98 @@ public:
    }
 
    // Refresh symbol info for specific symbol
-   void RefreshSymbolInfo(int symbolIdx) {
-      if(symbolIdx < 0 || symbolIdx >= m_symbolCount) return;
+   bool RefreshSymbolInfo(int symbolIdx) {
+      if(symbolIdx < 0 || symbolIdx >= m_symbolCount) return false;
       
-      string symbol = m_symbols[symbolIdx];
-      m_tickSizes[symbolIdx] = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-      m_points[symbolIdx] = SymbolInfoDouble(symbol, SYMBOL_POINT);
-      m_volSteps[symbolIdx] = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-      m_volMins[symbolIdx] = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-      m_volMaxs[symbolIdx] = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-      m_stopLevels[symbolIdx] = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-      m_fillingTypes[symbolIdx] = GetFillingType(symbol);
-      
-      if(m_isTester) {
-         m_symbolRefreshBars[symbolIdx] = (int)SeriesInfoInteger(symbol, _Period, SERIES_BARS_COUNT);
-      } else {
-         m_lastSymbolRefresh[symbolIdx] = GetTickCount64();
+      string symbol = m_strategies[symbolIdx].symbolName;
+      m_strategies[symbolIdx].tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+      m_strategies[symbolIdx].point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      m_strategies[symbolIdx].volStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      m_strategies[symbolIdx].volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      m_strategies[symbolIdx].volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+      long symbol_fetched_stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      if (symbol_fetched_stop_level > m_strategies[symbolIdx].stopLevelOverride) {
+         m_strategies[symbolIdx].stopLevel = symbol_fetched_stop_level;
       }
+      else {
+         m_strategies[symbolIdx].stopLevel = m_strategies[symbolIdx].stopLevelOverride;
+      }
+      m_strategies[symbolIdx].fillingType = GetFillingType(symbol);
+      m_strategies[symbolIdx].lastRefreshTime = GetTickCount64();
+      return true;
    }
 
-   void SetRiskSettings(RiskManagementMode mode, double value) {
-      m_riskMode  = mode;
-      m_riskValue = value;
-   }
+   // Calculate volume for specific strategy (returns unnormalized value)
+   double CalcRiskVolumeSymbol(int magic, double entryPrice, double slPrice) {
+      int idx = GetSymbolIndex(magic);
+      if(idx < 0) {
+         Print("Error: CalcRiskVolumeSymbol - Invalid symbol index for magic number ", magic);
+         return 0;
+      }
 
-   // Calculate risk volume for specific symbol (returns unnormalized value)
-   double CalcRiskVolumeSymbol(string symbol, double entryPrice, double slPrice) {
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0) return 0;
-      
-      double calculatedVol = m_volMins[idx];
-      if(m_riskMode == RiskFixedLot) return m_riskValue;
-      
+      // If fixed Lot return immediately
+      if(m_strategies[idx].riskMode == RiskFixedLot) {
+         return m_strategies[idx].riskValue;
+      }
+
+      // If RiskPercentBalance, calculate risk money based on account balance, otherwise use fixed money value
       double riskMoney = 0.0;
-      if(m_riskMode == RiskPercentBalance) riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (m_riskValue / 100.0);
-      else riskMoney = m_riskValue;
+      if(m_strategies[idx].riskMode == RiskPercentBalance) {
+         riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (m_strategies[idx].riskValue / 100.0);
+      }
+      else {
+         riskMoney = m_strategies[idx].riskValue;
+      }
 
       ENUM_ORDER_TYPE tempType = (entryPrice > slPrice) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
       
-      double potentialProfit = 0.0;
-      if(!OrderCalcProfit(tempType, symbol, 1.0, entryPrice, slPrice, potentialProfit)) {
-         Print("Error: CalcRiskVolumeSymbol - OrderCalcProfit failed for symbol ", symbol, ". Using minimum volume.");
-         return m_volMins[idx]; 
+      double lossPerLot = 0.0;
+      if(!OrderCalcProfit(tempType, m_strategies[idx].symbolName, 1.0, entryPrice, slPrice, lossPerLot)) {
+         Print("Error: CalcRiskVolumeSymbol - OrderCalcProfit failed for symbol ", m_strategies[idx].symbolName, ".");
+         return 0;
       }
 
-      double lossPerLot = MathAbs(potentialProfit);
-
-      if(lossPerLot > 0) calculatedVol = riskMoney / lossPerLot;
-      
-      return calculatedVol;
+      lossPerLot = MathAbs(lossPerLot);
+      if(lossPerLot > 0) {
+         double calculatedVol = riskMoney / lossPerLot;
+         return calculatedVol;
+      }
+      Print("Error: CalcRiskVolumeSymbol - Loss per lot is zero for symbol ", m_strategies[idx].symbolName, ". Cannot calculate volume.");
+      return 0;
    }
 
    // O(1) circular buffer enqueue with bounds checking
-   bool Trade(string symbol, ENUM_ORDER_TYPE type, double vol, double price, double sl, double tp, string comment, int requestID, datetime expiration=0) {
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0 || m_tradeQueueCounts[idx] >= 512) return false;
+   bool Trade(int magic, ENUM_ORDER_TYPE type, double vol, double price, double sl, double tp, string comment, int requestID, datetime expiration=0) {
+      int idx = GetSymbolIndex(magic);
+      if(idx < 0 || m_strategies[idx].tradeQueueCount >= MAX_QUEUE_SIZE) {
+         if (idx < 0) {
+            Print("Error: Trade - Invalid symbol index for magic number ", magic);
+         }
+         else {
+            Print("Error: Trade - Trade queue full for symbol ", m_strategies[idx].symbolName);
+         }
+         return false;
+      }
 
       // Handle automatic volume calculation based on risk mode
-      if(vol == 0) {
-         if(m_riskMode == RiskFixedLot) {
+      if(vol == 0.0) {
+         if(m_strategies[idx].riskMode == RiskFixedLot) {
             // RiskFixedLot: use the fixed lot value directly
-            vol = m_riskValue;
+            vol = m_strategies[idx].riskValue;
          }
-         else if(m_riskMode == RiskPercentBalance || m_riskMode == RiskFixedMoney) {
+         else if(m_strategies[idx].riskMode == RiskPercentBalance || m_strategies[idx].riskMode == RiskFixedMoney) {
             // RiskPercentBalance and RiskFixedMoney: calculate based on stop loss
             if(sl == 0) {
-               Print("Error: Cannot auto-calculate volume without SL. Volume=0, SL=0.");
+               Print("Error: Trade - Cannot auto-calculate volume without SL. Volume=0, SL=0 for symbol ", m_strategies[idx].symbolName);
                return false;
             }
             
             // Determine entry price for calculation
             double entryPrice = price;
-            if(entryPrice <= 0) {
+            if(DoubleComparison(entryPrice, "LESS OR EQUAL", 0.0)) {
                // Market order: use current bid/ask
-               double curAsk = SymbolInfoDouble(symbol, SYMBOL_ASK);
-               double curBid = SymbolInfoDouble(symbol, SYMBOL_BID);
+               double curAsk = SymbolInfoDouble(m_strategies[idx].symbolName, SYMBOL_ASK);
+               double curBid = SymbolInfoDouble(m_strategies[idx].symbolName, SYMBOL_BID);
                
                if(type == ORDER_TYPE_BUY) {
                   entryPrice = curAsk;
@@ -390,25 +425,23 @@ public:
                else if(type == ORDER_TYPE_SELL) {
                   entryPrice = curBid;
                }
-               else if(type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP) {
-                  entryPrice = curAsk;
-               }
-               else if(type == ORDER_TYPE_SELL_LIMIT || type == ORDER_TYPE_SELL_STOP) {
-                  entryPrice = curBid;
-               }
             }
             
-            vol = CalcRiskVolumeSymbol(symbol, entryPrice, sl);
+            vol = CalcRiskVolumeSymbol(magic, entryPrice, sl);
          }
       }
 
-      if(vol <= 0) return false;
+      if(DoubleComparison(vol, "LESS OR EQUAL", 0.0)) {
+         Print("Error: Trade - Calculated volume is zero or negative for symbol ", m_strategies[idx].symbolName, ". Volume: ", vol);
+         return false;
+      }
 
+      //TODO:
       m_tradeQueues[idx][m_tradeQueueTails[idx]].type       = type;
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].volume     = NormalizeVolSymbol(symbol, vol);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].price      = NormalizePriceSymbol(symbol, price);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].sl         = NormalizePriceSymbol(symbol, sl);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].tp         = NormalizePriceSymbol(symbol, tp);
+      m_tradeQueues[idx][m_tradeQueueTails[idx]].volume     = NormalizeVolSymbol(magic, vol);
+      m_tradeQueues[idx][m_tradeQueueTails[idx]].price      = NormalizePriceSymbol(magic, price);
+      m_tradeQueues[idx][m_tradeQueueTails[idx]].sl         = NormalizePriceSymbol(magic, sl);
+      m_tradeQueues[idx][m_tradeQueueTails[idx]].tp         = NormalizePriceSymbol(magic, tp);
       m_tradeQueues[idx][m_tradeQueueTails[idx]].expiration = expiration;
       m_tradeQueues[idx][m_tradeQueueTails[idx]].comment    = comment;
       m_tradeQueues[idx][m_tradeQueueTails[idx]].retryAt    = 0;
@@ -513,11 +546,7 @@ public:
       for(int s = 0; s < m_symbolCount; s++) {
          // Optimize symbol refresh: use iTime() for bar detection in tester (cached, not a terminal call)
          // iTime() is ~1000x faster than SeriesInfoInteger() per tick
-         if(m_isTester) {
-            if(OnNewBar(s)) {
-               RefreshSymbolInfo(s);
-            }
-         } else {
+         if(!m_isTester) {
             if(GetTickCount64() - m_lastSymbolRefresh[s] > 10000) {
                RefreshSymbolInfo(s);
             }
@@ -532,7 +561,7 @@ public:
 
          // Process trade queue (opens)
          while(m_tradeQueueCounts[s] > 0 && (m_isTester || (GetTickCount64() - startTime < m_processingBudgetMs))) {
-            if(!m_isTester && SymbolInfoInteger(m_symbols[s], SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) break;
+            if(!m_isTester && SymbolInfoInteger(m_strategies[s], SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) break;
             if(!ProcessTradeItem(s)) {
                break; // Retry delay active, stop processing this symbol
             }
@@ -542,7 +571,7 @@ public:
 
 private:
    bool ProcessTicketItem(int symbolIdx) {
-      string symbol = m_symbols[symbolIdx];
+      string symbol = m_strategies[symbolIdx];
       
       // Head points to next item to process; if empty queue, return false
       if(m_ticketQueueCounts[symbolIdx] <= 0) return false;
@@ -590,7 +619,7 @@ private:
    }
 
    bool ProcessTradeItem(int symbolIdx) {
-      string symbol = m_symbols[symbolIdx];
+      string symbol = m_strategies[symbolIdx];
       int idx = symbolIdx;  // idx is already passed as parameter, avoid O(n) lookup
       
       // Head points to next item to process
@@ -609,7 +638,7 @@ private:
       bool fatal = false;
       
       if(!CheckStopLevelSymbol(symbol, req.type, req.price, curAsk, curBid)) {
-         if(!m_isTester) Print("Trade Cancelled: StopLevel Violation.");
+         Print("Trade Cancelled: StopLevel Violation.");
          AddToFatalBuffer(req.requestID);
          m_tradeQueueHeads[symbolIdx] = (m_tradeQueueHeads[symbolIdx] + 1) % 512;
          m_tradeQueueCounts[symbolIdx]--;
@@ -622,9 +651,9 @@ private:
       if(req.type == ORDER_TYPE_BUY || req.type == ORDER_TYPE_SELL) {
          double spread = (curAsk - curBid) / m_points[idx];
          if(spread > m_maxSpread) {
-             if(!m_isTester) Print("Spread High (", spread, "). Waiting.");
+             Print("Spread High (", spread, "). Waiting.");
              m_tradeQueues[symbolIdx][m_tradeQueueHeads[symbolIdx]].retryAt = TimeCurrent() + m_retryDelay;
-             return false; // Don't dequeue; retry later
+             return false;
          }
          
          if(req.type == ORDER_TYPE_BUY) {
