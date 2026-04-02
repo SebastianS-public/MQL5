@@ -455,7 +455,7 @@ private:
 
       if(req.type == ORDER_TYPE_BUY || req.type == ORDER_TYPE_SELL) {
          long spread = SymbolInfoInteger(m_strategies[symbolIdx].symbolName, SYMBOL_SPREAD);
-         if(spread > m_strategies[symbolIdx].maxSpread) {
+         if(m_strategies[symbolIdx].maxSpread > 0 && spread > m_strategies[symbolIdx].maxSpread) {
             Print("Spread High (", spread, "). Waiting.");
             m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead].retryAt = TimeCurrent() + m_retryDelay;
             return false;
@@ -574,14 +574,14 @@ public:
 
       m_strategies[idx].symbolName = symbol;
       m_strategies[idx].magicNumber = magic;
+      m_strategies[idx].trade.SetExpertMagicNumber(magic);
       m_strategies[idx].stopLevelOverride = stopLevelOverride;
       m_strategies[idx].maxSpread = maxSpread;
-      m_strategies[idx].slippage = slippage;
-      m_strategies[idx].trade.SetDeviationInPoints(slippage);
-      m_strategies[idx].trade.SetExpertMagicNumber(magic);
       m_strategies[idx].trade.SetAsyncMode(false);
       m_strategies[idx].riskMode = riskMode;
       m_strategies[idx].riskValue = riskValue;
+      m_strategies[idx].slippage = (slippage <= 0) ? INT_MAX : slippage;
+      m_strategies[idx].trade.SetDeviationInPoints(m_strategies[idx].slippage);
       
       // Fetch symbol info
       if (!InitSymbolInfo(idx)) {
