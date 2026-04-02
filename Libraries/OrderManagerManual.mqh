@@ -2,6 +2,55 @@
 
 #include <Trade/Trade.mqh>
 
+/*
+   Order Manager Library for MQL5
+   Initialize with 
+      COrderManager orderManager
+      void Init(int retryDelay=5, uint timeBudgetMs=200)
+   
+   Add symbols with
+      bool AddStrategy(
+         int magic,
+         string symbol,
+         int maxSpread=100,
+         int slippage=10,
+         int stopLevelOverride=0,
+         RiskManagementMode riskMode=RiskPercentBalance,
+         double riskValue=2.0
+      )
+
+   Place trades with
+      bool Trade(
+         int magic,
+         ENUM_ORDER_TYPE type,
+         double vol,
+         double price,
+         double sl,
+         double tp,
+         string comment,
+         int requestID,
+         datetime expiration=0
+      )
+   
+   Close positions with
+      bool ClosePosition(int magic, ulong ticket, int requestID)
+   
+   Delete pending orders with
+      bool DeletePendingOrder(int magic, ulong ticket, int requestID)
+
+   Modify orders or positions with
+      bool ModifyTicket(int magic, ulong ticket, double price, double sl, double tp, int requestID)
+   
+   Check the status of a request with
+      RequestStatus GetRequestStatus(int id)
+   
+   Check if busy with
+      bool IsBusy()
+   
+   Finally call every tick:
+      void Process()
+*/
+
 // Constants for static array initializations
 #define MAX_QUEUE_SIZE 1024
 #define FATAL_BUFFER_SIZE 256
@@ -45,6 +94,7 @@ struct TradeRequest {
 struct TicketRequest {
    ulong ticket;
    EAState action;
+   double price;
    double sl;
    double tp;
    datetime retryAt;
@@ -228,6 +278,228 @@ private:
       return false;
    }
 
+   // Init symbol info for the specific sybol
+   bool InitSymbolInfo(int symbolIdx) {
+      if(symbolIdx < 0 || symbolIdx >= m_strategyCount) {
+         Print("Error: InitSymbolInfo - Invalid symbol index ", symbolIdx);
+         return false;
+      }
+      string symbol = m_strategies[symbolIdx].symbolName;
+      m_strategies[symbolIdx].tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+      m_strategies[symbolIdx].point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      m_strategies[symbolIdx].volStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      m_strategies[symbolIdx].volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      m_strategies[symbolIdx].volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+      m_strategies[symbolIdx].digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      m_strategies[symbolIdx].fillingType = GetFillingType(symbol);
+      m_strategies[symbolIdx].trade.SetTypeFilling(m_strategies[symbolIdx].fillingType);
+      m_strategies[symbolIdx].lastRefreshTime = GetTickCount64();
+      return true;
+   }
+
+   // Refresh symbol info for all symbols
+   void RefreshSymbolInfo() {
+      for(int i = 0; i < m_strategyCount; i++) {
+         RefreshSymbolInfo(i);
+      }
+   }
+
+   // Refresh symbol info for specific symbol
+   bool RefreshSymbolInfo(int symbolIdx) {
+      if(symbolIdx < 0 || symbolIdx >= m_strategyCount) {
+         Print("Error: RefreshSymbolInfo - Invalid symbol index ", symbolIdx);
+         return false;
+      }
+
+      string symbol = m_strategies[symbolIdx].symbolName;
+      long symbol_fetched_stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      if (symbol_fetched_stop_level > m_strategies[symbolIdx].stopLevelOverride) {
+         m_strategies[symbolIdx].stopLevel = symbol_fetched_stop_level;
+      }
+      else {
+         m_strategies[symbolIdx].stopLevel = m_strategies[symbolIdx].stopLevelOverride;
+      }
+      m_strategies[symbolIdx].lastRefreshTime = GetTickCount64();
+      return true;
+   }
+
+   // Calculate volume for specific strategy (returns unnormalized value)
+   double CalcRiskVolumeSymbol(int magic, double entryPrice, double slPrice) {
+      int idx = GetSymbolIndex(magic);
+      if(idx < 0) {
+         Print("Error: CalcRiskVolumeSymbol - Invalid symbol index for magic number ", magic);
+         return 0;
+      }
+
+      // If fixed Lot return immediately
+      if(m_strategies[idx].riskMode == RiskFixedLot) {
+         return m_strategies[idx].riskValue;
+      }
+
+      // If RiskPercentBalance, calculate risk money based on account balance, otherwise use fixed money value
+      double riskMoney = 0.0;
+      if(m_strategies[idx].riskMode == RiskPercentBalance) {
+         riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (m_strategies[idx].riskValue / 100.0);
+      }
+      else {
+         riskMoney = m_strategies[idx].riskValue;
+      }
+
+      ENUM_ORDER_TYPE tempType = (entryPrice > slPrice) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      
+      double lossPerLot = 0.0;
+      if(!OrderCalcProfit(tempType, m_strategies[idx].symbolName, 1.0, entryPrice, slPrice, lossPerLot)) {
+         Print("Error: CalcRiskVolumeSymbol - OrderCalcProfit failed for symbol ", m_strategies[idx].symbolName, ".");
+         return 0;
+      }
+
+      lossPerLot = MathAbs(lossPerLot);
+      if(lossPerLot > 0) {
+         double calculatedVol = riskMoney / lossPerLot;
+         return calculatedVol;
+      }
+      Print("Error: CalcRiskVolumeSymbol - Loss per lot is zero for symbol ", m_strategies[idx].symbolName, ". Cannot calculate volume.");
+      return 0;
+   }
+
+   bool ProcessTicketItem(int symbolIdx) {
+      // Head points to next item to process; if empty queue, return false
+      if(m_strategies[symbolIdx].ticketQueueCount <= 0) return false;
+      
+      TicketRequest req = m_strategies[symbolIdx].ticketQueue[m_strategies[symbolIdx].ticketQueueHead];
+      // Check retry delay (enabled in both live trading and backtesting)
+      if(TimeCurrent() < req.retryAt) return false;
+
+      bool res = false;
+      bool fatal = false;
+
+      if(req.action == STATE_PROCESSING_CLOSE) {
+         if(!PositionSelectByTicket(req.ticket)) fatal = true; 
+         else res = m_strategies[symbolIdx].trade.PositionClose(req.ticket);
+      }
+      else if(req.action == STATE_PROCESSING_DELETE) {
+         if(!OrderSelect(req.ticket)) fatal = true; 
+         else res = m_strategies[symbolIdx].trade.OrderDelete(req.ticket);
+      }
+      else if(req.action == STATE_PROCESSING_MODIFY) {
+         // Active Market Position
+         if(PositionSelectByTicket(req.ticket)) {
+            res = m_strategies[symbolIdx].trade.PositionModify(req.ticket, req.sl, req.tp);
+         }
+         // Pending Order
+         else if(OrderSelect(req.ticket)) {
+            res = m_strategies[symbolIdx].trade.OrderModify(
+               req.ticket,
+               req.price,
+               req.sl,
+               req.tp,
+               (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
+               (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION),
+               0.0
+            );
+         }
+         // Ticket not found
+         else {
+            Print("Error: ProcessTicketItem - Ticket ", req.ticket, " not found for symbol ", m_strategies[symbolIdx].symbolName);
+            fatal = true;
+         }
+      }
+
+      uint ret = m_strategies[symbolIdx].trade.ResultRetcode();
+
+      // Success, fatal error, or tester rejection = dequeue
+      if(fatal || (res && (ret == TRADE_RETCODE_DONE || ret == TRADE_RETCODE_PLACED)) || (m_isTester && !res)) {
+         if(fatal) {
+            Print("ERROR: Fatal Ticket Error - RequestID: ", req.requestID, " | Retcode: ", ret, " | Ticket: ", req.ticket, " | Action: ", req.action);
+            AddToFatalBuffer(req.requestID);
+         }
+         
+         // Dequeue from head (O(1) circular buffer operation)
+         m_strategies[symbolIdx].ticketQueueHead = (m_strategies[symbolIdx].ticketQueueHead + 1) % MAX_QUEUE_SIZE;
+         m_strategies[symbolIdx].ticketQueueCount--;
+         return true; 
+      } 
+      else {
+         Print("Error: Ticket Retry - RequestID: ", req.requestID, " | Retcode: ", ret, " | Ticket: ", req.ticket, " | NextRetryAt: ", TimeCurrent() + m_retryDelay);
+         m_strategies[symbolIdx].ticketQueue[m_strategies[symbolIdx].ticketQueueHead].retryAt = TimeCurrent() + m_retryDelay;
+         return false; // Don't dequeue; retry later
+      }
+   }
+
+   bool ProcessTradeItem(int symbolIdx) {
+      // Head points to next item to process
+      if(m_strategies[symbolIdx].tradeQueueCount <= 0) return false;
+      
+      TradeRequest req = m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead];
+      
+      // Check retry delay (enabled in both live trading and backtesting to handle market-closed errors)
+      if(TimeCurrent() < req.retryAt) return false;
+
+      // Cache market data (single call is more efficient than multiple)
+      double curAsk = SymbolInfoDouble(m_strategies[symbolIdx].symbolName, SYMBOL_ASK);
+      double curBid = SymbolInfoDouble(m_strategies[symbolIdx].symbolName, SYMBOL_BID);
+      
+      bool res = false;
+      bool fatal = false;
+      
+      if(!CheckStopLevelSymbol(m_strategies[symbolIdx].magicNumber, req.type, req.price, curAsk, curBid)) {
+         Print("Trade Cancelled: StopLevel Violation.");
+         AddToFatalBuffer(req.requestID);
+         m_strategies[symbolIdx].tradeQueueHead = (m_strategies[symbolIdx].tradeQueueHead + 1) % MAX_QUEUE_SIZE;
+         m_strategies[symbolIdx].tradeQueueCount--;
+         RefreshSymbolInfo(symbolIdx); 
+         return true;
+      }
+
+      double executionPrice = (DoubleComparison(req.price, "LESS OR EQUAL", 0.0)) ? 0.0 : req.price;
+
+      if(req.type == ORDER_TYPE_BUY || req.type == ORDER_TYPE_SELL) {
+         long spread = SymbolInfoInteger(m_strategies[symbolIdx].symbolName, SYMBOL_SPREAD);
+         if(spread > m_strategies[symbolIdx].maxSpread) {
+            Print("Spread High (", spread, "). Waiting.");
+            m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead].retryAt = TimeCurrent() + m_retryDelay;
+            return false;
+         }
+      }
+
+      // Execute trade
+      if(req.type == ORDER_TYPE_BUY) {
+         res = m_strategies[symbolIdx].trade.Buy(req.volume, m_strategies[symbolIdx].symbolName, executionPrice, req.sl, req.tp, req.comment);
+      }
+      else if(req.type == ORDER_TYPE_SELL) {
+         res = m_strategies[symbolIdx].trade.Sell(req.volume, m_strategies[symbolIdx].symbolName, executionPrice, req.sl, req.tp, req.comment);
+      }
+      else {
+         ENUM_ORDER_TYPE_TIME timeMode = (req.expiration > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
+         res = m_strategies[symbolIdx].trade.OrderOpen(m_strategies[symbolIdx].symbolName, req.type, req.volume, 0.0, req.price, req.sl, req.tp, timeMode, req.expiration, req.comment);
+      }
+
+      uint ret = m_strategies[symbolIdx].trade.ResultRetcode();
+      
+      // Detect fatal errors
+      if(ret == TRADE_RETCODE_INVALID_VOLUME || ret == TRADE_RETCODE_NO_MONEY || 
+         ret == TRADE_RETCODE_INVALID_STOPS || ret == TRADE_RETCODE_REJECT ||
+         ret == TRADE_RETCODE_INVALID_EXPIRATION) fatal = true;
+
+      if(ret == TRADE_RETCODE_INVALID_STOPS) RefreshSymbolInfo(symbolIdx);
+
+      // Dequeue on success or fatal error only; allow temporary errors to retry
+      if((res && (ret == TRADE_RETCODE_DONE || ret == TRADE_RETCODE_PLACED)) || fatal) {
+         if(fatal) {
+            Print("ERROR: Fatal Trade Error - RequestID: ", req.requestID, " | Retcode: ", ret, " | Symbol: ", m_strategies[symbolIdx].symbolName, " | Type: ", req.type, " | Volume: ", req.volume);
+            AddToFatalBuffer(req.requestID);
+         }
+         m_strategies[symbolIdx].tradeQueueHead = (m_strategies[symbolIdx].tradeQueueHead + 1) % MAX_QUEUE_SIZE;
+         m_strategies[symbolIdx].tradeQueueCount--;
+         return true;
+      }
+      else {
+         Print("ERROR: Trade Retry - RequestID: ", req.requestID, " | Retcode: ", ret, " | Symbol: ", m_strategies[symbolIdx].symbolName, " | Type: ", req.type, " | NextRetryAt: ", TimeCurrent() + m_retryDelay);
+         m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead].retryAt = TimeCurrent() + m_retryDelay;
+         return false; // Don't dequeue; retry later
+      }
+   }
+
    //Public methods
 public:
    COrderManager() { 
@@ -321,90 +593,6 @@ public:
       return true;
    }
 
-   // Init symbol info for the specific sybol
-   bool InitSymbolInfo(int symbolIdx) {
-      if(symbolIdx < 0 || symbolIdx >= m_strategyCount) {
-         Print("Error: InitSymbolInfo - Invalid symbol index ", symbolIdx);
-         return false;
-      }
-      string symbol = m_strategies[symbolIdx].symbolName;
-      m_strategies[symbolIdx].tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-      m_strategies[symbolIdx].point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-      m_strategies[symbolIdx].volStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-      m_strategies[symbolIdx].volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-      m_strategies[symbolIdx].volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-      m_strategies[symbolIdx].digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-      m_strategies[symbolIdx].fillingType = GetFillingType(symbol);
-      m_strategies[symbolIdx].trade.SetTypeFilling(m_strategies[symbolIdx].fillingType);
-      m_strategies[symbolIdx].lastRefreshTime = GetTickCount64();
-      return true;
-   }
-
-   // Refresh symbol info for all symbols
-   void RefreshSymbolInfo() {
-      for(int i = 0; i < m_strategyCount; i++) {
-         RefreshSymbolInfo(i);
-      }
-   }
-
-   // Refresh symbol info for specific symbol
-   bool RefreshSymbolInfo(int symbolIdx) {
-      if(symbolIdx < 0 || symbolIdx >= m_strategyCount) {
-         Print("Error: RefreshSymbolInfo - Invalid symbol index ", symbolIdx);
-         return false;
-      }
-
-      string symbol = m_strategies[symbolIdx].symbolName;
-      long symbol_fetched_stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-      if (symbol_fetched_stop_level > m_strategies[symbolIdx].stopLevelOverride) {
-         m_strategies[symbolIdx].stopLevel = symbol_fetched_stop_level;
-      }
-      else {
-         m_strategies[symbolIdx].stopLevel = m_strategies[symbolIdx].stopLevelOverride;
-      }
-      m_strategies[symbolIdx].lastRefreshTime = GetTickCount64();
-      return true;
-   }
-
-   // Calculate volume for specific strategy (returns unnormalized value)
-   double CalcRiskVolumeSymbol(int magic, double entryPrice, double slPrice) {
-      int idx = GetSymbolIndex(magic);
-      if(idx < 0) {
-         Print("Error: CalcRiskVolumeSymbol - Invalid symbol index for magic number ", magic);
-         return 0;
-      }
-
-      // If fixed Lot return immediately
-      if(m_strategies[idx].riskMode == RiskFixedLot) {
-         return m_strategies[idx].riskValue;
-      }
-
-      // If RiskPercentBalance, calculate risk money based on account balance, otherwise use fixed money value
-      double riskMoney = 0.0;
-      if(m_strategies[idx].riskMode == RiskPercentBalance) {
-         riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (m_strategies[idx].riskValue / 100.0);
-      }
-      else {
-         riskMoney = m_strategies[idx].riskValue;
-      }
-
-      ENUM_ORDER_TYPE tempType = (entryPrice > slPrice) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-      
-      double lossPerLot = 0.0;
-      if(!OrderCalcProfit(tempType, m_strategies[idx].symbolName, 1.0, entryPrice, slPrice, lossPerLot)) {
-         Print("Error: CalcRiskVolumeSymbol - OrderCalcProfit failed for symbol ", m_strategies[idx].symbolName, ".");
-         return 0;
-      }
-
-      lossPerLot = MathAbs(lossPerLot);
-      if(lossPerLot > 0) {
-         double calculatedVol = riskMoney / lossPerLot;
-         return calculatedVol;
-      }
-      Print("Error: CalcRiskVolumeSymbol - Loss per lot is zero for symbol ", m_strategies[idx].symbolName, ". Cannot calculate volume.");
-      return 0;
-   }
-
    // O(1) circular buffer enqueue with bounds checking
    bool Trade(int magic, ENUM_ORDER_TYPE type, double vol, double price, double sl, double tp, string comment, int requestID, datetime expiration=0) {
       int idx = GetSymbolIndex(magic);
@@ -493,6 +681,7 @@ public:
       TicketRequest req = {};
       req.ticket = ticket;
       req.action = STATE_PROCESSING_CLOSE;
+      req.price = 0;
       req.sl = 0;
       req.tp = 0;
       req.retryAt = 0;
@@ -524,6 +713,7 @@ public:
       TicketRequest req = {};
       req.ticket = ticket;
       req.action = STATE_PROCESSING_DELETE;
+      req.price = 0;
       req.sl = 0;
       req.tp = 0;
       req.retryAt = 0;
@@ -537,17 +727,17 @@ public:
    }
 
    // O(1) circular buffer enqueue with bounds checking
-   bool ModifyPosition(int magic, ulong ticket, double sl, double tp, int requestID) {
+   bool ModifyTicket(int magic, ulong ticket, double price, double sl, double tp, int requestID) {
       int idx = GetSymbolIndex(magic);
       if(idx < 0 || ticket <= 0 || m_strategies[idx].ticketQueueCount >= MAX_QUEUE_SIZE) {
          if(idx < 0) {
-            Print("Error: ModifyPosition - Invalid symbol index for magic number ", magic);
+            Print("Error: ModifyTicket - Invalid symbol index for magic number ", magic);
          }
          else if (ticket <= 0) {
-            Print("Error: ModifyPosition - Invalid ticket: ", ticket);
+            Print("Error: ModifyTicket - Invalid ticket: ", ticket);
          }
          else {
-            Print("Error: ModifyPosition - Trade queue full for symbol ", m_strategies[idx].symbolName);
+            Print("Error: ModifyTicket - Trade queue full for symbol ", m_strategies[idx].symbolName);
          }
          return false;
       }
@@ -555,6 +745,7 @@ public:
       TicketRequest req = {};
       req.ticket = ticket;
       req.action = STATE_PROCESSING_MODIFY;
+      req.price = NormalizePriceSymbol(magic, price);
       req.sl = NormalizePriceSymbol(magic, sl);
       req.tp = NormalizePriceSymbol(magic, tp);
       req.retryAt = 0;
@@ -637,146 +828,6 @@ public:
                break; // Retry delay active, stop processing this symbol
             }
          }
-      }
-   }
-
-private:
-   bool ProcessTicketItem(int symbolIdx) {
-      // Head points to next item to process; if empty queue, return false
-      if(m_strategies[symbolIdx].ticketQueueCount <= 0) return false;
-      
-      TicketRequest req = m_strategies[symbolIdx].ticketQueue[m_strategies[symbolIdx].ticketQueueHead];
-      // Check retry delay (enabled in both live trading and backtesting)
-      if(TimeCurrent() < req.retryAt) return false;
-
-      bool res = false;
-      bool fatal = false;
-
-      if(req.action == STATE_PROCESSING_CLOSE) {
-         if(!PositionSelectByTicket(req.ticket)) fatal = true; 
-         else res = m_strategies[symbolIdx].trade.PositionClose(req.ticket);
-      }
-      else if(req.action == STATE_PROCESSING_DELETE) {
-         if(!OrderSelect(req.ticket)) fatal = true; 
-         else res = m_strategies[symbolIdx].trade.OrderDelete(req.ticket);
-      }
-      else if(req.action == STATE_PROCESSING_MODIFY) {
-         // Active Market Position
-         if(PositionSelectByTicket(req.ticket)) {
-            res = m_strategies[symbolIdx].trade.PositionModify(req.ticket, req.sl, req.tp);
-         }
-         // Pending Order
-         else if(OrderSelect(req.ticket)) {
-            double currentPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-            res = m_strategies[symbolIdx].trade.OrderModify(
-               req.ticket,
-               currentPrice,
-               req.sl,
-               req.tp,
-               (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
-               (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION),
-               0.0
-            );
-         }
-         // Ticket not found
-         else {
-            Print("Error: ProcessTicketItem - Ticket ", req.ticket, " not found for symbol ", m_strategies[symbolIdx].symbolName);
-            fatal = true;
-         }
-      }
-
-      uint ret = m_strategies[symbolIdx].trade.ResultRetcode();
-
-      // Success, fatal error, or tester rejection = dequeue
-      if(fatal || (res && (ret == TRADE_RETCODE_DONE || ret == TRADE_RETCODE_PLACED)) || (m_isTester && !res)) {
-         if(fatal) {
-            Print("ERROR: Fatal Ticket Error - RequestID: ", req.requestID, " | Retcode: ", ret, " | Ticket: ", req.ticket, " | Action: ", req.action);
-            AddToFatalBuffer(req.requestID);
-         }
-         
-         // Dequeue from head (O(1) circular buffer operation)
-         m_strategies[symbolIdx].ticketQueueHead = (m_strategies[symbolIdx].ticketQueueHead + 1) % MAX_QUEUE_SIZE;
-         m_strategies[symbolIdx].ticketQueueCount--;
-         return true; 
-      } 
-      else {
-         Print("Error: Ticket Retry - RequestID: ", req.requestID, " | Retcode: ", ret, " | Ticket: ", req.ticket, " | NextRetryAt: ", TimeCurrent() + m_retryDelay);
-         m_strategies[symbolIdx].ticketQueue[m_strategies[symbolIdx].ticketQueueHead].retryAt = TimeCurrent() + m_retryDelay;
-         return false; // Don't dequeue; retry later
-      }
-   }
-
-   bool ProcessTradeItem(int symbolIdx) {
-      // Head points to next item to process
-      if(m_strategies[symbolIdx].tradeQueueCount <= 0) return false;
-      
-      TradeRequest req = m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead];
-      
-      // Check retry delay (enabled in both live trading and backtesting to handle market-closed errors)
-      if(TimeCurrent() < req.retryAt) return false;
-
-      // Cache market data (single call is more efficient than multiple)
-      double curAsk = SymbolInfoDouble(m_strategies[symbolIdx].symbolName, SYMBOL_ASK);
-      double curBid = SymbolInfoDouble(m_strategies[symbolIdx].symbolName, SYMBOL_BID);
-      
-      bool res = false;
-      bool fatal = false;
-      
-      if(!CheckStopLevelSymbol(m_strategies[symbolIdx].magicNumber, req.type, req.price, curAsk, curBid)) {
-         Print("Trade Cancelled: StopLevel Violation.");
-         AddToFatalBuffer(req.requestID);
-         m_strategies[symbolIdx].tradeQueueHead = (m_strategies[symbolIdx].tradeQueueHead + 1) % MAX_QUEUE_SIZE;
-         m_strategies[symbolIdx].tradeQueueCount--;
-         RefreshSymbolInfo(symbolIdx); 
-         return true;
-      }
-
-      double executionPrice = (DoubleComparison(req.price, "LESS OR EQUAL", 0.0)) ? 0.0 : req.price;
-
-      if(req.type == ORDER_TYPE_BUY || req.type == ORDER_TYPE_SELL) {
-         double spread = (curAsk - curBid) / m_strategies[symbolIdx].point;
-         if(spread > m_strategies[symbolIdx].maxSpread) {
-            Print("Spread High (", spread, "). Waiting.");
-            m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead].retryAt = TimeCurrent() + m_retryDelay;
-            return false;
-         }
-      }
-
-      // Execute trade
-      if(req.type == ORDER_TYPE_BUY) {
-         res = m_strategies[symbolIdx].trade.Buy(req.volume, m_strategies[symbolIdx].symbolName, executionPrice, req.sl, req.tp, req.comment);
-      }
-      else if(req.type == ORDER_TYPE_SELL) {
-         res = m_strategies[symbolIdx].trade.Sell(req.volume, m_strategies[symbolIdx].symbolName, executionPrice, req.sl, req.tp, req.comment);
-      }
-      else {
-         ENUM_ORDER_TYPE_TIME timeMode = (req.expiration > 0) ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
-         res = m_strategies[symbolIdx].trade.OrderOpen(m_strategies[symbolIdx].symbolName, req.type, req.volume, 0.0, req.price, req.sl, req.tp, timeMode, req.expiration, req.comment);
-      }
-
-      uint ret = m_strategies[symbolIdx].trade.ResultRetcode();
-      
-      // Detect fatal errors
-      if(ret == TRADE_RETCODE_INVALID_VOLUME || ret == TRADE_RETCODE_NO_MONEY || 
-         ret == TRADE_RETCODE_INVALID_STOPS || ret == TRADE_RETCODE_REJECT ||
-         ret == TRADE_RETCODE_INVALID_EXPIRATION) fatal = true;
-
-      if(ret == TRADE_RETCODE_INVALID_STOPS) RefreshSymbolInfo(symbolIdx);
-
-      // Dequeue on success or fatal error only; allow temporary errors to retry
-      if((res && (ret == TRADE_RETCODE_DONE || ret == TRADE_RETCODE_PLACED)) || fatal) {
-         if(fatal) {
-            Print("ERROR: Fatal Trade Error - RequestID: ", req.requestID, " | Retcode: ", ret, " | Symbol: ", m_strategies[symbolIdx].symbolName, " | Type: ", req.type, " | Volume: ", req.volume);
-            AddToFatalBuffer(req.requestID);
-         }
-         m_strategies[symbolIdx].tradeQueueHead = (m_strategies[symbolIdx].tradeQueueHead + 1) % MAX_QUEUE_SIZE;
-         m_strategies[symbolIdx].tradeQueueCount--;
-         return true;
-      }
-      else {
-         Print("ERROR: Trade Retry - RequestID: ", req.requestID, " | Retcode: ", ret, " | Symbol: ", m_strategies[symbolIdx].symbolName, " | Type: ", req.type, " | NextRetryAt: ", TimeCurrent() + m_retryDelay);
-         m_strategies[symbolIdx].tradeQueue[m_strategies[symbolIdx].tradeQueueHead].retryAt = TimeCurrent() + m_retryDelay;
-         return false; // Don't dequeue; retry later
       }
    }
 };
