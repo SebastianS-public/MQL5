@@ -228,7 +228,7 @@ private:
    //Public methods
 public:
    COrderManager() { 
-      m_symbolCount = 0;
+      m_strategyCount = 0;
       m_fatalIDCount = 0;
       m_fatalIDIndex = 0;
       
@@ -283,11 +283,11 @@ public:
    }
 
    // Add a symbol to the manager and init symbol specific settings
-   bool AddSymbol(int magic, string symbol, int maxSpread=100, int slippage=10, int stopLevelOverride=0, RiskManagementMode riskMode=RiskPercentBalance, double riskValue=2.0) {
-      int idx = m_symbolCount;
+   bool AddStrategy(int magic, string symbol, int maxSpread=100, int slippage=10, int stopLevelOverride=0, RiskManagementMode riskMode=RiskPercentBalance, double riskValue=2.0) {
+      int idx = m_strategyCount;
 
       if(idx >= MAX_STRATEGIES - 1) {
-         Print("Error: Maximum ", MAX_STRATEGIES, " symbols per instance");
+         Print("Error: Maximum ", MAX_STRATEGIES, " strategies per instance");
          return false;
       }
 
@@ -313,8 +313,8 @@ public:
          Print("Error: Failed to refresh symbol info for ", symbol);
          return false;
       }
-      m_symbolCount++;
-      Print("Added symbol ", symbol, " with magic ", magic, " at index ", idx);
+      m_strategyCount++;
+      Print("Added strategy with symbol ", symbol, " with magic ", magic, " at index ", idx);
       return true;
    }
 
@@ -327,7 +327,7 @@ public:
 
    // Refresh symbol info for specific symbol
    bool RefreshSymbolInfo(int symbolIdx) {
-      if(symbolIdx < 0 || symbolIdx >= m_symbolCount) return false;
+      if(symbolIdx < 0 || symbolIdx >= m_strategyCount) return false;
       
       string symbol = m_strategies[symbolIdx].symbolName;
       m_strategies[symbolIdx].tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -436,92 +436,142 @@ public:
          return false;
       }
 
-      //TODO:
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].type       = type;
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].volume     = NormalizeVolSymbol(magic, vol);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].price      = NormalizePriceSymbol(magic, price);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].sl         = NormalizePriceSymbol(magic, sl);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].tp         = NormalizePriceSymbol(magic, tp);
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].expiration = expiration;
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].comment    = comment;
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].retryAt    = 0;
-      m_tradeQueues[idx][m_tradeQueueTails[idx]].requestID  = requestID;
+      //TODO: Check if correct
+      TradeRequest req = {};
+      req.type = type;
+      req.volume = NormalizeVolSymbol(magic, vol);
+      req.price = NormalizePriceSymbol(magic, price);
+      req.sl = NormalizePriceSymbol(magic, sl);
+      req.tp = NormalizePriceSymbol(magic, tp);
+      req.expiration = expiration;
+      req.comment = comment;
+      req.retryAt = 0;
+      req.requestID = requestID;
 
-      m_tradeQueueTails[idx] = (m_tradeQueueTails[idx] + 1) % 512;
-      m_tradeQueueCounts[idx]++;
+      m_strategies[idx].tradeQueue[m_strategies[idx].tradeQueueTail] = req;
+
+      m_strategies[idx].tradeQueueTail = (m_strategies[idx].tradeQueueTail + 1) % MAX_QUEUE_SIZE;
+      m_strategies[idx].tradeQueueCount++;
       return true;
    }
 
    // O(1) circular buffer enqueue with bounds checking
-   bool ClosePosition(string symbol, ulong ticket, int requestID) {
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0 || ticket <= 0 || m_ticketQueueCounts[idx] >= 512) return false;
+   bool ClosePosition(int magic, ulong ticket, int requestID) {
+      int idx = GetSymbolIndex(magic);
+      if(idx < 0 || ticket <= 0 || m_ticketQueueCounts[idx] >= MAX_QUEUE_SIZE) {
+         if(idx < 0) {
+            Print("Error: ClosePosition - Invalid symbol index for magic number ", magic);
+         }
+         else if (ticket <= 0) {
+            Print("Error: ClosePosition - Invalid ticket: ", ticket);
+         }
+         else {
+            Print("Error: ClosePosition - Trade queue full for symbol ", m_strategies[idx].symbolName);
+         }
+         return false;
+      }
 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].ticket = ticket;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].action = STATE_PROCESSING_CLOSE;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].sl = 0; 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].tp = 0; 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].retryAt = 0;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].requestID = requestID;
+      TicketRequest req = {};
+      req.ticket = ticket;
+      req.action = STATE_PROCESSING_CLOSE;
+      req.sl = 0;
+      req.tp = 0;
+      req.retryAt = 0;
+      req.requestID = requestID;
+
+      m_strategies[idx].ticketQueue[m_strategies[idx].ticketQueueTail] = req;
       
-      m_ticketQueueTails[idx] = (m_ticketQueueTails[idx] + 1) % 512;
-      m_ticketQueueCounts[idx]++;
+      m_strategies[idx].ticketQueueTail = (m_strategies[idx].ticketQueueTail + 1) % MAX_QUEUE_SIZE;
+      m_strategies[idx].ticketQueueCount++;
       return true;
    }
 
    // O(1) circular buffer enqueue with bounds checking
-   bool DeletePendingOrder(string symbol, ulong ticket, int requestID) {
-      int idx = GetSymbolIndex(symbol);
-      if(idx < 0 || ticket <= 0 || m_ticketQueueCounts[idx] >= 512) return false;
+   bool DeletePendingOrder(int magic, ulong ticket, int requestID) {
+      int idx = GetSymbolIndex(magic);
+      if(idx < 0 || ticket <= 0 || m_ticketQueueCounts[idx] >= MAX_QUEUE_SIZE) {
+         if(idx < 0) {
+            Print("Error: DeletePendingOrder - Invalid symbol index for magic number ", magic);
+         }
+         else if (ticket <= 0) {
+            Print("Error: DeletePendingOrder - Invalid ticket: ", ticket);
+         }
+         else {
+            Print("Error: DeletePendingOrder - Trade queue full for symbol ", m_strategies[idx].symbolName);
+         }
+         return false;
+      }
 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].ticket = ticket;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].action = STATE_PROCESSING_DELETE;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].sl = 0; 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].tp = 0; 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].retryAt = 0;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].requestID = requestID;
+      TicketRequest req = {};
+      req.ticket = ticket;
+      req.action = STATE_PROCESSING_DELETE;
+      req.sl = 0;
+      req.tp = 0;
+      req.retryAt = 0;
+      req.requestID = requestID;
+
+      m_strategies[idx].ticketQueue[m_strategies[idx].ticketQueueTail] = req;
       
-      m_ticketQueueTails[idx] = (m_ticketQueueTails[idx] + 1) % 512;
-      m_ticketQueueCounts[idx]++;
+      m_strategies[idx].ticketQueueTail = (m_strategies[idx].ticketQueueTail + 1) % MAX_QUEUE_SIZE;
+      m_strategies[idx].ticketQueueCount++;
       return true;
    }
 
    // O(1) circular buffer enqueue with bounds checking
-   bool ModifyPosition(string symbol, ulong ticket, double sl, double tp, int requestID) {
+   bool ModifyPosition(int magic, ulong ticket, double sl, double tp, int requestID) {
       int idx = GetSymbolIndex(symbol);
-      if(idx < 0 || ticket <= 0 || m_ticketQueueCounts[idx] >= 512) return false;
+      if(idx < 0 || ticket <= 0 || m_ticketQueueCounts[idx] >= MAX_QUEUE_SIZE) {
+         if(idx < 0) {
+            Print("Error: ModifyPosition - Invalid symbol index for magic number ", magic);
+         }
+         else if (ticket <= 0) {
+            Print("Error: ModifyPosition - Invalid ticket: ", ticket);
+         }
+         else {
+            Print("Error: ModifyPosition - Trade queue full for symbol ", m_strategies[idx].symbolName);
+         }
+         return false;
+      }
 
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].ticket = ticket;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].action = STATE_PROCESSING_MODIFY;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].sl = NormalizePriceSymbol(symbol, sl);
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].tp = NormalizePriceSymbol(symbol, tp);
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].retryAt = 0;
-      m_ticketQueues[idx][m_ticketQueueTails[idx]].requestID = requestID;
+      TicketRequest req = {};
+      req.ticket = ticket;
+      req.action = STATE_PROCESSING_MODIFY;
+      req.sl = NormalizePriceSymbol(symbol, sl);
+      req.tp = NormalizePriceSymbol(symbol, tp);
+      req.retryAt = 0;
+      req.requestID = requestID;
+
+      m_strategies[idx].ticketQueue[m_strategies[idx].ticketQueueTail] = req;
       
-      m_ticketQueueTails[idx] = (m_ticketQueueTails[idx] + 1) % 512;
-      m_ticketQueueCounts[idx]++;
+      m_strategies[idx].ticketQueueTail = (m_strategies[idx].ticketQueueTail + 1) % MAX_QUEUE_SIZE;
+      m_strategies[idx].ticketQueueCount++;
       return true;
    }
    
-   // O(n*m) request status lookup where n = symbols, m = average queue size
+   // O(n*m) request status lookup where n = strategies, m = average queue size
    // Searches all symbols' trade and ticket queues linearly
    RequestStatus GetRequestStatus(int id) {
-      // 1. Check Fatal Error Buffer first (O(n) where n <= 128)
-      if(IsIDInFatalBuffer(id)) return REQ_STATUS_ERROR;
+      if(IsIDInFatalBuffer(id)) {
+         return REQ_STATUS_ERROR;
+      }
       
       // 2. Check all Trade Queues
-      for(int s = 0; s < m_symbolCount; s++) {
-         for(int i = 0; i < m_tradeQueueCounts[s]; i++) {
-            int idx = (m_tradeQueueHeads[s] + i) % 512;
-            if(m_tradeQueues[s][idx].requestID == id) return REQ_STATUS_PENDING;
+      for(int s = 0; s < m_strategyCount; s++) {
+         for(int i = 0; i < m_strategies[s].tradeQueueCount; i++) {
+            int idx = (m_strategies[s].tradeQueueHead + i) % MAX_QUEUE_SIZE;
+            if(m_strategies[s].tradeQueue[idx].requestID == id) {
+               return REQ_STATUS_PENDING;
+            }
          }
       }
       
       // 3. Check all Ticket Queues
-      for(int s = 0; s < m_symbolCount; s++) {
-         for(int i = 0; i < m_ticketQueueCounts[s]; i++) {
-            int idx = (m_ticketQueueHeads[s] + i) % 512;
-            if(m_ticketQueues[s][idx].requestID == id) return REQ_STATUS_PENDING;
+      for(int s = 0; s < m_strategyCount; s++) {
+         for(int i = 0; i < m_strategies[s].ticketQueueCount; i++) {
+            int idx = (m_strategies[s].ticketQueueHead + i) % MAX_QUEUE_SIZE;
+            if(m_strategies[s].ticketQueue[idx].requestID == id) {
+               return REQ_STATUS_PENDING;
+            }
          }
       }
 
@@ -530,12 +580,15 @@ public:
    }
 
    bool IsBusy() { 
-      for(int s = 0; s < m_symbolCount; s++) {
-         if(m_tradeQueueCounts[s] > 0 || m_ticketQueueCounts[s] > 0) return true;
+      for(int s = 0; s < m_strategyCount; s++) {
+         if(m_strategies[s].tradeQueueCount > 0 || m_strategies[s].ticketQueueCount > 0) {
+            return true;
+         }
       }
       return false;
    }
 
+   // TODO:
    void Process() {
       if(!m_isTester && !TerminalInfoInteger(TERMINAL_CONNECTED)) return;
       
