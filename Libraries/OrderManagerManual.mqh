@@ -271,7 +271,6 @@ private:
    
    // O(n) linear buffer search
    bool IsIDInFatalBuffer(int id) {
-      if(id <= 0) return false;
       for(int i = 0; i < m_fatalIDCount; i++) {
          if(m_fatalIDBuffer[i] == id) return true;
       }
@@ -280,7 +279,7 @@ private:
 
    // Init symbol info for the specific sybol
    bool InitSymbolInfo(int symbolIdx) {
-      if(symbolIdx < 0 || symbolIdx >= m_strategyCount) {
+      if(symbolIdx < 0 || symbolIdx > m_strategyCount) {
          Print("Error: InitSymbolInfo - Invalid symbol index ", symbolIdx);
          return false;
       }
@@ -761,6 +760,9 @@ public:
    // O(n*m) request status lookup where n = strategies, m = average queue size
    // Searches all symbols' trade and ticket queues linearly
    RequestStatus GetRequestStatus(int id) {
+      if(id < 0) {
+         Print("Error: GetRequestStatus - Called Method with id < 0.");
+      }
       if(IsIDInFatalBuffer(id)) {
          return REQ_STATUS_ERROR;
       }

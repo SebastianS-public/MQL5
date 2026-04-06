@@ -3,8 +3,8 @@
 #include "..\\Libraries\\OrderManagerManual.mqh"
 
 input group "Trade Settings"
-input double TakeProfit = 100;
-input double StopLoss = 50;
+input int TakeProfit = 100;
+input int StopLoss = 50;
 input string TradeComment = "GoLong";
 input int MagicNumber = 12345;
 
@@ -26,67 +26,160 @@ struct DailyTimes {
    datetime closeTime;
 };
 
+struct RequestStatusBufferStruct {
+   int requestID;
+   RequestStatus status;
+   bool isTimerSet;
+};
+
 DailyTimes dailyTimes;
 COrderManager manager;
-datetime lastTickTime = 0;
 bool positionOpenedToday = false;
+bool positionClosedToday = false;
+RequestStatusBufferStruct requestStatusBuffer[10] = {};
+int openRequestCount = 0;
 
-
-int openRequestID = 0;
-int closeRequestID = 0;
-RequestStatus lastOpenStatus = REQ_STATUS_SUCCESS;
-RequestStatus lastCloseStatus = REQ_STATUS_SUCCESS;
-
-bool recoveredFromHoliday = false;
-
-void OnInit() {
+int OnInit() {
+   if(RiskMode != RiskFixedLot && StopLoss == 0) {
+      return INIT_PARAMETERS_INCORRECT;
+   }
    manager.Init(5, 100);
-   manager.AddStrategy(MagicNumber, _Symbol, 0, 0, 0, RiskMode, getRiskValue());
+   if(!manager.AddStrategy(MagicNumber, _Symbol, 0, 0, 0, RiskMode, getRiskValue())) {
+      return INIT_FAILED;
+   }
+   return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason) {
    Print("GoLong EA deinitializing. Reason: ", reason);
 }
 
-// TODO: Currently it is set to reset on new day, might be better to reset at specified time
-// to be able to deal with summer/winter time changes and other edge cases
 void OnTick() {
-   manager.Process();
-
    datetime currentTime = TimeCurrent();
-   if(lastTickTime > 0) {
-      long timeSinceLastTick = currentTime - lastTickTime;
-      if(timeSinceLastTick > 24 * 3600) {
-         Print("Detected a gap of ", timeSinceLastTick / 3600, " hours since last tick.");
-      }
-   }
-   lastTickTime = currentTime;
 
    if(IsNewCalenderDay(currentTime)) {
-      ResetDailyState();
       CheckAndCloseExistingPositions();
+      ResetDailyState();
       CalcEntryExitTimes(currentTime);
+   }
+   
+   if(currentTime >= dailyTimes.openTime && currentTime < dailyTimes.closeTime && !positionOpenedToday) {
+      OpenPosition();
+   }
+   if(currentTime >= dailyTimes.closeTime && positionOpenedToday && !positionClosedToday) {
+      CheckAndCloseExistingPositions();
+      positionClosedToday = true;
+   }
+   manager.Process();
+}
+
+void OnTimer() {
+   if(openRequestCount == 0) {
+      EventKillTimer();
+      return;
+   }
+   for(int i = 0; i < 10; i++) {
+      if(requestStatusBuffer[i].requestID == 0) break;
+      else if(requestStatusBuffer[i].isTimerSet) {
+         RequestStatus status = manager.GetRequestStatus(requestStatusBuffer[i].requestID);
+         Print("Timer Check - Request ID ", requestStatusBuffer[i].requestID, " status: ", status);
+         if(status == REQ_STATUS_SUCCESS || status == REQ_STATUS_ERROR) {
+            ZeroMemory(requestStatusBuffer[i]);
+            openRequestCount--;
+         }
+      }
    }
 }
 
-bool CheckAndCloseExistingPositions() {
+void OpenPosition() {
+   Print("OpenPosition - Attempting to open position");
+   double tp = 0;
+   double sl = 0;
+   if(TakeProfit != 0) {
+      tp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + TakeProfit * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   }
+   if(StopLoss != 0) {
+      sl = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - StopLoss * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   }
+   int requestID = GenerateRequestID();
+   bool success = manager.Trade(MagicNumber, ORDER_TYPE_BUY, 0, 0, sl, tp, TradeComment, requestID);
+   if(success) {
+      Print("OpenPosition - Opening position successfull");
+      positionOpenedToday = true;
+      CheckRequestStatus(requestID);
+   }
+   else {
+      Print("OpenPosition - Failed to open position");
+   }
+}
+
+void CheckAndCloseExistingPositions() {
+   Print("CheckAndCloseExistingPositions - Checking for existing positions to close");
    for(int i = PositionsTotal() -1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-      
+      else {
+         Print("CheckAndCloseExistingPositions - Closing ticket: ", ticket);
+         int requestID = GenerateRequestID();
+         bool success = manager.ClosePosition(MagicNumber, ticket, requestID);
+         if(success) {
+            CheckRequestStatus(requestID);
+         }
+      }
+   }
+   Print("CheckAndCloseExistingPositions - Done checking for existing positions");
+}
+
+void CheckRequestStatus(int requestID) {
+   RequestStatus status = manager.GetRequestStatus(requestID);
+   Print("Check Request Status - Request ID ", requestID, " status: ", status);
+   if(status == REQ_STATUS_PENDING) {
+      for(int i = 0; i < 10; i++) {
+         if(requestStatusBuffer[i].requestID == requestID) {
+            break;
+         }
+         if(requestStatusBuffer[i].requestID == 0) {
+            requestStatusBuffer[i].requestID = requestID;
+            requestStatusBuffer[i].status = REQ_STATUS_PENDING;
+            requestStatusBuffer[i].isTimerSet = true;
+            EventSetTimer(1);
+            openRequestCount++;
+            break;
+         }
+      }
+   }
+   else if(status == REQ_STATUS_SUCCESS || status == REQ_STATUS_ERROR) {
+      for(int i = 0; i < 10; i++) {
+         if(requestStatusBuffer[i].requestID == requestID) {
+            ZeroMemory(requestStatusBuffer[i]);
+            openRequestCount--;
+            break;
+         }
+         else if (requestStatusBuffer[i].requestID == 0) {
+            break;
+         }
+      }
    }
 }
 
+int GenerateRequestID() {
+   static int requestCounter = 1;
+   return requestCounter++;
+}
+
 void CalcEntryExitTimes(datetime currentTime) {
+   Print("CalcEntryExitTimes - Calculating target entry and exit times for the day");
    MqlDateTime timeStruct;
    TimeToStruct(currentTime, timeStruct);
    timeStruct.hour = OpenHour;
    timeStruct.min = OpenMinute;
    timeStruct.sec = 0;
    datetime targetOpenTime = StructToTime(timeStruct);
+   Print("CalcEntryExitTimes - Open Time: ", TimeToString(targetOpenTime, TIME_DATE | TIME_SECONDS));
    timeStruct.hour = CloseHour;
    timeStruct.min = CloseMinute;
    datetime targetCloseTime = StructToTime(timeStruct);
+   Print("CalcEntryExitTimes - Close Time: ", TimeToString(targetCloseTime, TIME_DATE | TIME_SECONDS));
 
    if(currentTime >= targetOpenTime && currentTime < targetCloseTime) {
       targetOpenTime = currentTime;
@@ -97,10 +190,7 @@ void CalcEntryExitTimes(datetime currentTime) {
 
 void ResetDailyState() {
    positionOpenedToday = false;
-   openRequestID = 0;
-   closeRequestID = 0;
-   lastOpenStatus = REQ_STATUS_SUCCESS;
-   lastCloseStatus = REQ_STATUS_SUCCESS;
+   positionClosedToday = false;
    Print("=== Daily state reset ===");
 }
 
