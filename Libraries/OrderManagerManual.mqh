@@ -557,11 +557,16 @@ public:
    }
 
    // Add a symbol to the manager and init symbol specific settings
-   bool AddStrategy(int magic, string symbol, int maxSpread=100, int slippage=10, int stopLevelOverride=0, RiskManagementMode riskMode=RiskPercentBalance, double riskValue=2.0) {
+   bool AddStrategy(int magic, string symbol, int maxSpread, int slippage, int stopLevelOverride, RiskManagementMode riskMode, double riskValue) {
       int idx = m_strategyCount;
 
       if(idx >= MAX_STRATEGIES) {
          Print("Error: Maximum ", MAX_STRATEGIES, " strategies per instance");
+         return false;
+      }
+
+      if(riskMode < 0) {
+         Print("Error: Invalid risk mode ", riskMode, " for symbol ", symbol);
          return false;
       }
 
@@ -605,7 +610,7 @@ public:
          return false;
       }
 
-      // Handle automatic volume calculation based on risk mode
+      // If no volume is specified, perform automatic volume calculation based on risk mode
       if(DoubleComparison(vol, "EQUAL", 0.0)) {
          if(m_strategies[idx].riskMode == RiskFixedLot) {
             // RiskFixedLot: use the fixed lot value directly

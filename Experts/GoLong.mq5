@@ -2,6 +2,14 @@
 
 #include "..\\Libraries\\OrderManagerManual.mqh"
 
+enum ExtRiskManagementMode {
+   ExtRiskFixedLot,
+   ExtRiskPercentBalance,
+   ExtRiskFixedMoney,
+   RiskScalingByContractAccountBalance
+};
+
+
 input group "Trade Settings"
 input int TakeProfit = 100;
 input int StopLoss = 50;
@@ -9,10 +17,11 @@ input string TradeComment = "GoLong";
 input int MagicNumber = 12345;
 
 input group "Risk Management"
-input RiskManagementMode RiskMode = RiskPercentBalance;
+input ExtRiskManagementMode RiskMode = ExtRiskPercentBalance;
 input double RiskInPercent = 2.0;
 input double LotSizeFixed = 0.1;
 input double RiskMoneyFixed = 100.0;
+input double RiskAccountBalanceInPercentPerContract = 50.0;
 
 input group "Trading Hours"
 input int OpenHour = 9;
@@ -38,19 +47,39 @@ bool positionOpenedToday = false;
 bool positionClosedToday = false;
 RequestStatusBufferStruct requestStatusBuffer[10] = {};
 int openRequestCount = 0;
+int counter = 0;
 
 int OnInit() {
-   if(RiskMode != RiskFixedLot && StopLoss == 0) {
-      return INIT_PARAMETERS_INCORRECT;
+   if(
+      (RiskMode == ExtRiskFixedMoney && StopLoss == 0) ||
+      (RiskMode == RiskScalingByContractAccountBalance && RiskAccountBalanceInPercentPerContract == 0) ||
+      (RiskMode == ExtRiskPercentBalance && StopLoss == 0)) {
+         return INIT_PARAMETERS_INCORRECT;
    }
    manager.Init(5, 100);
-   if(!manager.AddStrategy(MagicNumber, _Symbol, 0, 0, 0, RiskMode, getRiskValue())) {
+   RiskManagementMode managerRiskMode = -1;
+   switch (RiskMode) {
+      case ExtRiskFixedLot:
+         managerRiskMode = RiskFixedLot;
+         break;
+      case ExtRiskPercentBalance:
+         managerRiskMode = RiskPercentBalance;
+         break;
+      case ExtRiskFixedMoney:
+         managerRiskMode = RiskFixedMoney;
+         break;
+      case RiskScalingByContractAccountBalance:
+         managerRiskMode = RiskFixedMoney;
+         break;
+   }
+   if(!manager.AddStrategy(MagicNumber, _Symbol, 0, 0, 0, managerRiskMode, getRiskValue())) {
       return INIT_FAILED;
    }
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason) {
+   Print("Counter: ", counter);
    Print("GoLong EA deinitializing. Reason: ", reason);
 }
 
@@ -58,7 +87,9 @@ void OnTick() {
    datetime currentTime = TimeCurrent();
 
    if(IsNewCalenderDay(currentTime)) {
-      CheckAndCloseExistingPositions();
+      if(CheckAndCloseExistingPositions()) {
+         counter++;
+      }
       ResetDailyState();
       CalcEntryExitTimes(currentTime);
    }
@@ -95,14 +126,18 @@ void OpenPosition() {
    Print("OpenPosition - Attempting to open position");
    double tp = 0;
    double sl = 0;
+   double vol = 0;
    if(TakeProfit != 0) {
       tp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + TakeProfit * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    }
    if(StopLoss != 0) {
       sl = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - StopLoss * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    }
+   if(RiskMode == RiskScalingByContractAccountBalance) {
+      vol = CalcVolumeBasedOnAccountBalance();
+   }
    int requestID = GenerateRequestID();
-   bool success = manager.Trade(MagicNumber, ORDER_TYPE_BUY, 0, 0, sl, tp, TradeComment, requestID);
+   bool success = manager.Trade(MagicNumber, ORDER_TYPE_BUY, vol, 0, sl, tp, TradeComment, requestID);
    if(success) {
       Print("OpenPosition - Opening position successfull");
       positionOpenedToday = true;
@@ -113,7 +148,15 @@ void OpenPosition() {
    }
 }
 
-void CheckAndCloseExistingPositions() {
+double CalcVolumeBasedOnAccountBalance() {
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskInMoney = accountBalance * (RiskAccountBalanceInPercentPerContract / 100.0);
+   double ticksToZero = SymbolInfoDouble(_Symbol, SYMBOL_ASK) / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lossPerLot = ticksToZero * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   return riskInMoney / lossPerLot;
+}
+
+bool CheckAndCloseExistingPositions() {
    Print("CheckAndCloseExistingPositions - Checking for existing positions to close");
    for(int i = PositionsTotal() -1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
@@ -124,10 +167,12 @@ void CheckAndCloseExistingPositions() {
          bool success = manager.ClosePosition(MagicNumber, ticket, requestID);
          if(success) {
             CheckRequestStatus(requestID);
+            return true;
          }
       }
    }
    Print("CheckAndCloseExistingPositions - Done checking for existing positions");
+   return false;
 }
 
 void CheckRequestStatus(int requestID) {
@@ -218,10 +263,10 @@ bool IsNewCalenderDay(datetime currentTime) {
 }
 
 double getRiskValue() {
-   if(RiskMode == RiskFixedLot) {
+   if(RiskMode == ExtRiskFixedLot || RiskMode == RiskScalingByContractAccountBalance) {
       return LotSizeFixed;
    }
-   else if(RiskMode == RiskPercentBalance) {
+   else if(RiskMode == ExtRiskPercentBalance) {
       return RiskInPercent;
    }
    else {
